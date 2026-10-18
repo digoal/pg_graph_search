@@ -1,0 +1,4 @@
+comment = 'Property-graph search for PostgreSQL: a meta-function that generates concrete, parameterized graph search functions for any edge table'
+default_version = '1.0.0'
+relocatable = false
+schema = 'graph_search'
