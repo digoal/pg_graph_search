@@ -18,13 +18,16 @@ DECLARE
   v_tbl   text := p_n->>'table';
   v_c1    text := format('%I', p_n->>'c1');
   v_c2    text := format('%I', p_n->>'c2');
-  v_prop  text := coalesce(format('%I', p_n->>'prop'), 'NULL::jsonb');
+  -- prop 可省略：format('%I', NULL) 会直接报错，必须先判空再格式化；
+  -- 这里直接产出完整表达式（含 e. 前缀），缺省时不能拼成 e.NULL::jsonb
+  v_prop  text := CASE WHEN p_n->>'prop' IS NULL THEN 'NULL::jsonb'
+                       ELSE format('e.%I', p_n->>'prop') END;
   v_w     text := p_n->>'weight_expr';
   v_view  text := format('%I.%I', p_n->>'target_schema', p_n->>'prefix' || '_edge');
   v_one   text;
 BEGIN
   v_one := format(
-    'SELECT e.%1$s AS src, e.%2$s AS dst, e.%3$s AS prop, (%4$s) AS w FROM %5$s e',
+    'SELECT e.%1$s AS src, e.%2$s AS dst, %3$s AS prop, (%4$s) AS w FROM %5$s e',
     v_c1, v_c2, v_prop, v_w, v_tbl);
 
   IF (p_n->>'directed')::boolean THEN
@@ -32,7 +35,7 @@ BEGIN
   END IF;
 
   RETURN 'CREATE OR REPLACE VIEW ' || v_view || ' AS ' || v_one || ' UNION ALL ' ||
-         format('SELECT e.%1$s AS src, e.%2$s AS dst, e.%3$s AS prop, (%4$s) AS w FROM %5$s e',
+         format('SELECT e.%1$s AS src, e.%2$s AS dst, %3$s AS prop, (%4$s) AS w FROM %5$s e',
                 v_c2, v_c1, v_prop, v_w, v_tbl) || ';';
 END
 $pga$;

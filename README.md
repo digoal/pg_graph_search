@@ -10,6 +10,10 @@
 
 一条命令，得到 5 个可直接调用的函数 + 1 张统一边视图 + 1 条注册记录。
 
+> **给 AI Agent 的操作手册在 [SKILL.md](SKILL.md)**：触发条件、5 分钟上手、生成 API 的精确签名、
+> spec 参数、报错对照表、性能量级，以及"改 `sql/` 模板 → 跑回归"的验证闭环。
+> README 讲**为什么这么设计**，SKILL.md 讲**怎么用、怎么验、哪里会踩坑**。
+
 ---
 
 ## 一、设计要点
@@ -25,7 +29,7 @@
 | 清理 | **`uninstall(schema, prefix)`** | 按依赖反序删除生成对象，清 registry |
 | 盘点 | **`list_installed()`** | 列出所有实例 |
 
-`plan()` 与 `install()` 分离是有意的：生成的代码你���先看一眼再落库，
+`plan()` 与 `install()` 分离是有意的：生成的代码你可以先看一眼再落库，
 也可以直接 `psql -f` 人工执行。
 
 ### 2. 统一边视图
@@ -195,10 +199,21 @@ PG 不允许递归 CTE 的 anchor 项直接带 `ORDER BY` / `LIMIT` 后接 `UNIO
 
 ## 七、测试
 
-    bash test/lint_sql.py            # SQL 模板静态门禁（4 类高危问题）
-    psql -f test/01_setup.sql        # 造小图 + 装实例
-    psql -f test/02_correctness.sql  # 15 项人工可推演的正确性验证
-    psql -f test/03_regress.sql      # 14 项断言式回归
+    bash test/verify_all.sh          # 全链路：静态门禁 → make install → 建扩展 → 正确性 → 回归
+
+    # 或者单步跑（<db> 换成自己的测试库）
+    python3 test/lint_sql.py         # SQL 模板静态门禁（4 类高危问题，不需要数据库）
+    psql -d <db> -f test/01_setup.sql        # 造小图 + 装实例
+    psql -d <db> -f test/02_correctness.sql  # 15 项人工可推演的正确性验证
+    psql -d <db> -f test/03_regress.sql      # 16 项断言式回归
+
+`verify_all.sh` 会 `make install` 并在 `postgres` 库上重装扩展；只想验证改动时，
+用 SKILL.md 第 9 节的"独立库验证配方"，不碰已安装的 extension 目录。
+
+> 环境提示：若实例的 `shared_preload_libraries` 里预载了 `age`，在"age 已预载、
+> 但当前库未 `CREATE EXTENSION age`"的库里，`03_regress.sql` 的 R10 会在 `TRUNCATE`
+> 临时表时报 `schema "ag_catalog" does not exist`（AGE 的钩子介入，与本扩展无关）。
+> 测试库先 `CREATE EXTENSION age;`，或换一个未预载 age 的实例。
 
 静态门禁抓到过真实 bug（子查询投影缺 `AS` 别名导致运行期报
 `column t.depth does not exist`），值得在改模板后先跑一遍。
@@ -266,3 +281,27 @@ PG 不允许递归 CTE 的 anchor 项直接带 `ORDER BY` / `LIMIT` 后接 `UNIO
 * **未测**：并行执行下的最短路径。`max_parallel_workers_per_gather > 0` 时
   BFS 每层的聚合是否可并行收益未验证。
 * **未测**：并发写场景。压测期间只有读。
+
+---
+
+## 九、目录结构与配套 SKILL.md
+
+    pg_graph_search/
+    ├── SKILL.md                     # 面向 AI Agent 的操作手册：怎么用、怎么验、哪里会踩坑
+    ├── README.md                    # 本文：设计动机、相对原文的修正、实测数据
+    ├── Makefile                     # 拼接 sql/*.sql → pg_graph_search--1.0.0.sql
+    ├── pg_graph_search--1.0.0.sql  # 交付物，由 make sql 生成，勿手改
+    ├── pg_graph_search.control     # 扩展元信息（schema=graph_search，不可重定位）
+    ├── sql/                         # 唯一需要手改的源，6 个片段按文件名顺序拼接
+    │   ├── 00_header.sql            #   文件头注释
+    │   ├── 10_assert.sql            #   列断言 / schema 限定渲染 / 反向索引体检 / 点类型推导
+    │   ├── 20_norm.sql              #   _norm：spec 校验与缺省补齐
+    │   ├── 30_ddl_basic.sql         #   边视图 + N 度搜索 + 游标 DDL 构造器
+    │   ├── 31_ddl_shortest.sql      #   最短路径（BFS）+ 子图 JSON + 分层统计 DDL 构造器
+    │   └── 40_meta.sql              #   registry / plan / advise / install / uninstall / list
+    ├── test/                        # 静态门禁 + 正确性 + 断言式回归 + 一键全链路
+    ├── bench/                       # 95 万边规模压测与数据生成脚本
+    └── doc/                         # 预留
+
+使用顺序：人读 `README.md` 了解设计；Agent 读 `SKILL.md` 执行操作；
+改实现只改 `sql/`，然后 `make sql` + 跑 `test/`。

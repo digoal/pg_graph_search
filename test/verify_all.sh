@@ -32,13 +32,13 @@ else
   echo "correctness OK（$n 个预期抛错，其余全过）"
 fi
 
-step "6. 断言式回归（14 项）"
+step "6. 断言式回归（16 项）"
 su postgres -c "psql -X -q -v VERBOSITY=terse -d postgres -f test/03_regress.sql" > /tmp/_reg.log 2>&1
 tail -3 /tmp/_reg.log
 if grep -q "ERROR" /tmp/_reg.log; then
   grep -E "ERROR" /tmp/_reg.log | head -5; FAIL=1
 else
-  echo "regress OK（14/14）"
+  echo "regress OK（16/16）"
 fi
 
 step "7. Markdown 渲染门禁"

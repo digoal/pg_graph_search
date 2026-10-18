@@ -91,10 +91,19 @@ BEGIN
 
       o_path := v_path;
       o_depth := v_d;
-      SELECT coalesce(array_agg(e.prop ORDER BY t.ord), '{}'::jsonb[])
+      -- 路径相邻两点配对：src = v_path[1..n-1], dst = v_path[2..n]。
+      -- 每条边取权重最大的一条，与 BFS 的 DISTINCT ON (dst) 口径一致。
+      SELECT coalesce(array_agg(x.prop ORDER BY t.ord), '{}'::jsonb[])
         INTO o_link_props
-        FROM unnest(v_path, v_path[1:greatest(array_length(v_path,1)-1,1)]) WITH ORDINALITY AS t(dst, src, ord)
-        JOIN %4$s e ON e.src = t.src AND e.dst = t.dst;
+        FROM unnest(v_path[1:array_length(v_path,1)-1],
+                    v_path[2:array_length(v_path,1)]) WITH ORDINALITY AS t(src, dst, ord)
+        CROSS JOIN LATERAL (
+          SELECT e.prop
+            FROM %4$s e
+           WHERE e.src = t.src AND e.dst = t.dst
+           ORDER BY e.w DESC
+           LIMIT 1
+        ) x;
       RETURN NEXT;
       RETURN;
     END IF;

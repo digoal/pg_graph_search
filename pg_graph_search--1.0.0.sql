@@ -294,13 +294,16 @@ DECLARE
   v_tbl   text := p_n->>'table';
   v_c1    text := format('%I', p_n->>'c1');
   v_c2    text := format('%I', p_n->>'c2');
-  v_prop  text := coalesce(format('%I', p_n->>'prop'), 'NULL::jsonb');
+  -- prop 可省略：format('%I', NULL) 会直接报错，必须先判空再格式化；
+  -- 这里直接产出完整表达式（含 e. 前缀），缺省时不能拼成 e.NULL::jsonb
+  v_prop  text := CASE WHEN p_n->>'prop' IS NULL THEN 'NULL::jsonb'
+                       ELSE format('e.%I', p_n->>'prop') END;
   v_w     text := p_n->>'weight_expr';
   v_view  text := format('%I.%I', p_n->>'target_schema', p_n->>'prefix' || '_edge');
   v_one   text;
 BEGIN
   v_one := format(
-    'SELECT e.%1$s AS src, e.%2$s AS dst, e.%3$s AS prop, (%4$s) AS w FROM %5$s e',
+    'SELECT e.%1$s AS src, e.%2$s AS dst, %3$s AS prop, (%4$s) AS w FROM %5$s e',
     v_c1, v_c2, v_prop, v_w, v_tbl);
 
   IF (p_n->>'directed')::boolean THEN
@@ -308,7 +311,7 @@ BEGIN
   END IF;
 
   RETURN 'CREATE OR REPLACE VIEW ' || v_view || ' AS ' || v_one || ' UNION ALL ' ||
-         format('SELECT e.%1$s AS src, e.%2$s AS dst, e.%3$s AS prop, (%4$s) AS w FROM %5$s e',
+         format('SELECT e.%1$s AS src, e.%2$s AS dst, %3$s AS prop, (%4$s) AS w FROM %5$s e',
                 v_c2, v_c1, v_prop, v_w, v_tbl) || ';';
 END
 $pga$;
@@ -527,10 +530,19 @@ BEGIN
 
       o_path := v_path;
       o_depth := v_d;
-      SELECT coalesce(array_agg(e.prop ORDER BY t.ord), '{}'::jsonb[])
+      -- 路径相邻两点配对：src = v_path[1..n-1], dst = v_path[2..n]。
+      -- 每条边取权重最大的一条，与 BFS 的 DISTINCT ON (dst) 口径一致。
+      SELECT coalesce(array_agg(x.prop ORDER BY t.ord), '{}'::jsonb[])
         INTO o_link_props
-        FROM unnest(v_path, v_path[1:greatest(array_length(v_path,1)-1,1)]) WITH ORDINALITY AS t(dst, src, ord)
-        JOIN %4$s e ON e.src = t.src AND e.dst = t.dst;
+        FROM unnest(v_path[1:array_length(v_path,1)-1],
+                    v_path[2:array_length(v_path,1)]) WITH ORDINALITY AS t(src, dst, ord)
+        CROSS JOIN LATERAL (
+          SELECT e.prop
+            FROM %4$s e
+           WHERE e.src = t.src AND e.dst = t.dst
+           ORDER BY e.w DESC
+           LIMIT 1
+        ) x;
       RETURN NEXT;
       RETURN;
     END IF;
@@ -833,7 +845,6 @@ BEGIN
   v_ddl := graph_search.plan(p_spec);
   FOREACH v_stmt IN ARRAY v_ddl LOOP
     EXECUTE v_stmt;
-    EXECUTE v_stmt;
   END LOOP;
 
   INSERT INTO graph_search.registry
@@ -933,5 +944,7 @@ COMMENT ON FUNCTION graph_search.list_installed() IS '列出所有已安装的�
 
 
 CREATE OR REPLACE FUNCTION graph_search.version()
-RETURNS text LANGUAGE sql IMMUTABLE
-AS $$ SELECT 'pg_graph_search ' || current_setting('pg_extension.extversion', true) $$;
+RETURNS text LANGUAGE sql STABLE
+AS $$ SELECT 'pg_graph_search ' || coalesce(
+              (SELECT extversion FROM pg_extension WHERE extname = 'pg_graph_search'),
+              'unknown') $$;

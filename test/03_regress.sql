@@ -232,5 +232,35 @@ BEGIN
 END $$;
 \echo 'R14 OK'
 
+\echo '--- R15: 最短路径沿途边属性与跳数一一对应 ---'
+DO $$
+DECLARE v jsonb[]; n int;
+BEGIN
+  SELECT o_link_props INTO v FROM gtest.t_shortest_path(1, 11, 10);
+  IF v IS NULL OR array_length(v,1) IS NULL THEN
+    RAISE EXCEPTION 'o_link_props 为空';
+  END IF;
+  SELECT array_length(o_path,1) INTO n FROM gtest.t_shortest_path(1, 11, 10);
+  IF array_length(v,1) <> n - 1 THEN
+    RAISE EXCEPTION 'o_link_props 有 % 条，路径 % 跳，应为 %', array_length(v,1), n, n - 1;
+  END IF;
+  IF EXISTS (SELECT 1 FROM unnest(v) x WHERE x IS NULL) THEN
+    RAISE EXCEPTION 'o_link_props 含 NULL：有跳没有匹配到边';
+  END IF;
+END $$;
+\echo 'R15 OK'
+
+\echo '--- R16: spec 省略 prop 也能安装（prop/w 退化为 NULL/0） ---'
+DO $$
+DECLARE n int;
+BEGIN
+  PERFORM graph_search.install('{"table":"public.t_edge","target_schema":"gtest","prefix":"nop"}'::jsonb);
+  SELECT count(*) INTO n FROM gtest.nop_search(1, 2, 10, 0);
+  IF n < 1 THEN RAISE EXCEPTION '省略 prop 的实例搜索返回 0 行';
+  END IF;
+  PERFORM graph_search.uninstall('gtest', 'nop', false);
+END $$;
+\echo 'R16 OK'
+
 \echo ''
-\echo '==== 全部 14 项回归通过 ===='
+\echo '==== 全部 16 项回归通过 ===='

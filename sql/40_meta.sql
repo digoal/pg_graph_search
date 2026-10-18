@@ -135,7 +135,6 @@ BEGIN
   v_ddl := graph_search.plan(p_spec);
   FOREACH v_stmt IN ARRAY v_ddl LOOP
     EXECUTE v_stmt;
-    EXECUTE v_stmt;
   END LOOP;
 
   INSERT INTO graph_search.registry
@@ -235,5 +234,7 @@ COMMENT ON FUNCTION graph_search.list_installed() IS '列出所有已安装的�
 
 
 CREATE OR REPLACE FUNCTION graph_search.version()
-RETURNS text LANGUAGE sql IMMUTABLE
-AS $$ SELECT 'pg_graph_search ' || current_setting('pg_extension.extversion', true) $$;
+RETURNS text LANGUAGE sql STABLE
+AS $$ SELECT 'pg_graph_search ' || coalesce(
+              (SELECT extversion FROM pg_extension WHERE extname = 'pg_graph_search'),
+              'unknown') $$;
