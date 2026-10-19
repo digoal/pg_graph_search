@@ -2,7 +2,7 @@
 
 ## 图 1　图搜索算法
 
-![pg_graph_search 图搜索算法](pg_graph_search_1_algorithm.svg)
+![pg_graph_search 图搜索算法](pic/pg_graph_search_1_algorithm.svg)
 
 覆盖内容：
 
@@ -15,7 +15,7 @@
 
 ## 图 2　两个平台的调用逻辑对比
 
-![两平台调用逻辑对比](pg_graph_search_2_platform_compare.svg)
+![两平台调用逻辑对比](pic/pg_graph_search_2_platform_compare.svg)
 
 覆盖内容：
 
@@ -27,7 +27,7 @@
 
 ## 图 3　适配做了什么
 
-![适配做了什么](pg_graph_search_3_adaptation.svg)
+![适配做了什么](pic/pg_graph_search_3_adaptation.svg)
 
 四层结构：
 
