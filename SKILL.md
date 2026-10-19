@@ -5,7 +5,7 @@ description: 操作与扩展 pg_graph_search（PostgreSQL 属性图搜索扩展�
 
 # pg_graph_search 操作手册
 
-项目位置：`/root/new/shared_git/pg_graph_search`
+项目位置：`OpenTenBase/contrib/pg_graph_search`（OpenTenBase 源码树内）
 
 一句话：**元函数按你的边表结构生成业务函数**。不再手写那 200 行 `WITH RECURSIVE`，
 一次 `install()` 得到 1 张统一边视图 + 5 个可直接调用的函数 + 1 条 registry 记录。
@@ -31,10 +31,16 @@ description: 操作与扩展 pg_graph_search（PostgreSQL 属性图搜索扩展�
 ## 1. 5 分钟上手（以下命令在 PG 18.6 实测通过）
 
 ```bash
-cd /root/new/shared_git/pg_graph_search
-make                 # 由 sql/ 片段拼出 pg_graph_search--1.0.0.sql
-make install         # 装到 $(pg_config --sharedir)/extension
+cd contrib/pg_graph_search      # 相对 OpenTenBase 源码根
+make                 # 由 sql/ 片段拼出 pg_graph_search--1.0.0.sql（含 DISTRIBUTE BY REPLICATION）
+make install         # 装到 $(DESTDIR)$(pg_config --sharedir)/extension
 psql -c "CREATE EXTENSION pg_graph_search;"
+```
+
+原生 PostgreSQL 上做功能验证用可移植版（分布子句与 `sql_mode` 都去掉）：
+
+```bash
+make portable        # → pg_graph_search--1.0.0-portable.sql + pg_graph_search-portable.control
 ```
 
 ```sql
@@ -171,16 +177,24 @@ SELECT graph_search.uninstall('graph', 'user');            -- 卸载并清 regis
 ## 7. 测试与验证闭环
 
 ```bash
-python3 test/lint_sql.py           # 1) SQL 模板静态门禁（4 类高危问题，无数据库）
-psql -d <db> -f test/01_setup.sql      # 2) 造 12 点小图 + 装有向/无向实例
+python3 test/lint_sql.py                # 1) SQL 模板静态门禁（4 类高危问题，无数据库）
+psql -d <db> -f test/01_setup.sql       # 2) 造 12 点小图 + 装有向/无向实例
 psql -d <db> -f test/02_correctness.sql # 3) 15 项正确性（第 14/15 项的 ERROR 是预期抛错）
-psql -d <db> -f test/03_regress.sql     # 4) 16 项断言式回归
-bash test/verify_all.sh            # 全链路：门禁 → make install → CREATE EXTENSION → 2/3/4
+psql -d <db> -f test/03_regress.sql     # 4) 18 项断言式回归
+bash test/verify_all.sh                 # 全链路：make → 门禁 → 建临时库 → 装载 → 2/3/4 → 分布策略
 ```
 
-注意：`verify_all.sh` 会 `make install` 并在 **postgres 库** 上
-`DROP EXTENSION ... CASCADE` 后重装，属于会改共享实例的动作；
-只想验证改动时，用上面的单库流程更安全。
+`verify_all.sh` 自动识别平台：原生 PG 上直接 `\i` 可移植版 SQL；
+OpenTenBase 上要求先 `make install`（全节点）再 `CREATE EXTENSION`。
+它只建一个临时库（`DBNAME=gs_verify`），验证完 `DROP`，不碰系统已装扩展；
+`KEEP_DB=1` 保留，`SKIP_MAKE=1` 跳过构建。
+
+分布式补充用例（集群上才跑）：
+
+```bash
+psql -d <db> -f test/opentenbase/01_setup_distributed.sql  # 复制表/哈希表 × 有向/无向对照
+psql -d <db> -f test/opentenbase/02_verify_nodes.sql       # EXECUTE DIRECT 看 DN 侧对象
+```
 
 **环境陷阱（本机实测）**：本机 `shared_preload_libraries = age, pg_cron, pg_stat_statements`。
 在"age 已预载但当前库没有 `CREATE EXTENSION age`"的库里，`test/03_regress.sql` 的 R10
@@ -208,7 +222,9 @@ bash test/verify_all.sh            # 全链路：门禁 → make install → CRE
    必须走白名单校验。
 6. **改行为就补断言**：新增/修改用例加在 `test/03_regress.sql`（断言失败即非零退出），
    人工可推演的期望值放 `test/02_correctness.sql`；同时更新 `verify_all.sh` 里的项数文案。
-7. 模板改动后先在临时库验证（下面第 9 节），确认 16/16 再考虑 `make install`。
+7. 模板改动后先在临时库验证（下面第 9 节），确认 18/18 再考虑 `make install`。
+8. **只在 OpenTenBase 生效的片段**用 `@DISTRIBUTE_CLAUSE@` 占位符（目前只有注册表一处），
+   `make` / `make portable` 各自替换，禁止在片段里直接写死 `DISTRIBUTE BY ...`。
 
 已知的实现细节（改代码前先知道）：
 
@@ -224,16 +240,16 @@ bash test/verify_all.sh            # 全链路：门禁 → make install → CRE
 ## 9. 不改共享实例的验证配方（本机实测可用）
 
 ```bash
-cd /root/new/shared_git/pg_graph_search
-make sql
+cd contrib/pg_graph_search
+make portable        # 用无分布子句的可移植版，单机加载不会报语法错
 # 用独立库验证生成的 SQL，不碰系统 extension 目录
 su postgres -c "psql -X -q -d postgres \
   -c 'DROP DATABASE IF EXISTS gs_check;' -c 'CREATE DATABASE gs_check;'"
 su postgres -c "psql -X -q -v ON_ERROR_STOP=1 -d gs_check \
   -c 'CREATE EXTENSION age;' -c 'CREATE SCHEMA graph_search;' \
-  -f $(pwd)/pg_graph_search--1.0.0.sql"
+  -f $(pwd)/pg_graph_search--1.0.0-portable.sql"
 su postgres -c "psql -X -q -v ON_ERROR_STOP=1 -d gs_check -f test/01_setup.sql"
-su postgres -c "psql -X -q -d gs_check -f test/03_regress.sql"   # 期望：全部 16 项回归通过
+su postgres -c "psql -X -q -d gs_check -f test/03_regress.sql"   # 期望：全部 18 项回归通过
 su postgres -c "psql -X -q -d gs_check -f test/02_correctness.sql"  # 期望：仅第 71/77 行两处预期 ERROR
 su postgres -c "psql -X -q -d postgres -c 'DROP DATABASE gs_check;'"
 ```
@@ -244,9 +260,34 @@ su postgres -c "psql -X -q -d postgres -c 'DROP DATABASE gs_check;'"
 
 ---
 
-## 10. 交付前自检
+## 10. OpenTenBase 分布式部署（与单机唯一的差异）
 
-- [ ] `make sql` 后 `pg_graph_search--1.0.0.sql` 已更新，且与 `sql/` 片段一致
+| 项 | 单机做法 | OpenTenBase 做法 |
+|---|---|---|
+| 装载 | `\i portable.sql` 或 `CREATE EXTENSION` | `make install` 到**所有节点**的 `sharedir`，再在 CN 上 `CREATE EXTENSION` |
+| 注册表 | 普通表 | 必须 `DISTRIBUTE BY REPLICATION`（`make` 默认注入） |
+| 边表 | 随便建 | 中小图用 `DISTRIBUTE BY REPLICATION`（每 DN 全量）；大图用 `HASH(c1)` 但需压测 |
+| SQL 模式 | 只有 postgresql | `opentenbase_ora` 模式下也能建扩展（control 里 `sql_mode = 'all'`） |
+
+上线前必查：
+
+```sql
+SELECT graph_search.registry_distribution();  -- 期望 REPLICATION
+SELECT graph_search.set_registry_replication();  -- 已是 REPLICATION 时幂等返回
+```
+
+`registry_distribution()` 返回非 `REPLICATION` 时，`install()` 只发 WARNING 不阻断。
+原因：注册表不是 REPLICATION 时，每个 DN 只看到一部分实例清单，
+`uninstall()` / `list_installed()` 会出现"装了但查不到"。
+
+完整 Runbook、依据（`check_extension_in_right_mode()`、两阶段 `CREATE EXTENSION`）、
+待实测清单见 `doc/opentenbase-port.md`。
+
+---
+
+## 11. 交付前自检
+
+- [ ] `make` 与 `make portable` 都跑过，两个产物都由 `sql/` 片段生成（勿手改）
 - [ ] `python3 test/lint_sql.py` 通过
 - [ ] `test/03_regress.sql` 全绿（改动行为时断言数同步更新）
 - [ ] `test/02_correctness.sql` 只有第 71/77 行两处预期 ERROR

@@ -96,12 +96,94 @@ PG 不允许递归 CTE 的 anchor 项直接带 `ORDER BY` / `LIMIT` 后接 `UNIO
 
 ## 三、安装
 
-    make
-    make install          # 安装到 `pg_config --sharedir` 指向的 extension 目录
+原生 PostgreSQL（默认档位）：
+
+    make USE_PGXS=1
+    make USE_PGXS=1 install    # 安装到 `pg_config --sharedir` 指向的 extension 目录
     psql -c "CREATE EXTENSION pg_graph_search;"
 
-要求 PostgreSQL 12 及以上（`WITH ORDINALITY`、`jsonb_object_agg` 等）。
+OpenTenBase：
+
+    make USE_PGXS=1 OPENTENBASE=1
+    make USE_PGXS=1 OPENTENBASE=1 install
+
+档位说明见 [3.1](#31-在-opentenbase本仓库里构建)。
+
+### 3.1 在 OpenTenBase 上构建
+
+本仓库是独立项目，不依赖 OpenTenBase 源码树，直接指定档位即可：
+
+    make USE_PGXS=1 OPENTENBASE=1
+    make USE_PGXS=1 OPENTENBASE=1 install
+
+如果你要把本扩展并进自己的 OpenTenBase 源码树（作为 `contrib/pg_graph_search`，
+此时无 `USE_PGXS`，会自动取 `OPENTENBASE=1`），需要先把内核编出来：
+
+    cd <OpenTenBase 源码根>
+    chmod +x configure configure.in                     # 仓库里没有可执行位
+    ./configure --prefix=$PWD/_install --enable-user-switch --with-libxml \
+                --disable-license --with-openssl CFLAGS="-g -mcx16"
+    make -j8 && make install                            # 别用 -sj，出错会静默
+    cd contrib && make -j8 && make install
+
+    # 只编这一个扩展（开发期）
+    make -C contrib/pg_graph_search && make -C contrib/pg_graph_search install
+
+构建期的三个坑（都是上游仓库的，不是本扩展的）：
+
+1. `src/include/opentenbase_ora/gram_ora.h` 在仓库里是从 macOS 提交的 `XSym` 符号链接占位，
+   Linux 上会被当普通头文件编译 → `'OraScanKeywords' undeclared`。删掉它让 bison 重新生成。
+2. `CFLAGS` 缺 `-mcx16` 时，`pg_atomic_compare_and_swap_u128()` 里的
+   `__sync_val_compare_and_swap` 会引用 `__sync_val_compare_and_swap_16`，
+   而 `libatomic` 并不导出该符号 → `collect2: error: ld returned 1`。
+3. `configure` 把 zstd/lz4 的路径写死为 `/usr/local/lib/lib*.a`；
+   用 `--without-zstd --without-lz4`，或把系统库软链到该路径。
+
+两个构建档位（同一份源码，`OPENTENBASE` 开关切换）：
+
+| 命令 | SQL 产物 | control | 用途 |
+|---|---|---|---|
+| `make USE_PGXS=1`（**默认**） | `pg_graph_search--1.0.0.sql`（无 `DISTRIBUTE BY`） | 无 `sql_mode` | **原生 PostgreSQL 部署** |
+| `make USE_PGXS=1 OPENTENBASE=1` | 同上，但含 `DISTRIBUTE BY REPLICATION` | `sql_mode = 'all'` | OpenTenBase 部署 |
+| `make`（在 OpenTenBase contrib 树内） | 同 `OPENTENBASE=1` | 同上 | 随内核一起编 |
+| `make portable` | `pg_graph_search--1.0.0-portable.sql` | `pg_graph_search-portable.control` | 双平台回归时的对照产物，不发布 |
+
+两平台的实际差异只有两处（`sql_mode` 那行 control 参数、`DISTRIBUTE BY REPLICATION` 那段 DDL），
+由 `OPENTENBASE` 一个变量同时切换，源码只有一份。
+
+> **别把档位用反。** 原生 PostgreSQL 拿到带 `DISTRIBUTE BY REPLICATION` 的 SQL 会直接报
+> `syntax error at or near "DISTRIBUTE"`；拿到带 `sql_mode` 的 control 会报
+> `unrecognized parameter "sql_mode"`。所以**发布出去的产物默认是原生 PG 那份**。
+
+生成物（`pg_graph_search--*.sql`、`pg_graph_search.control`）不入库，
+真源是 `sql/*.sql` 片段与 `pg_graph_search.control.in`。
+
+### 3.2 版本要求
+
 纯 SQL 扩展，无编译产物，无需 `pg_config --includedir-server`。
+用到的 SQL 特性最低版本 ≤ 9.6（`jsonb`/`WITH ORDINALITY` 9.4、`jsonb_object_agg`/`ON CONFLICT` 9.5），
+因此 **OpenTenBase 的 PG 10 内核基线在特性层面是满足的**。
+
+### 3.3 验证状态（2026-10）
+
+| 环境 | 验证内容 | 结果 |
+|---|---|---|
+| 原生 PostgreSQL 18.6 | 静态门禁 / 15 项正确性 / 18 项断言回归 / pg_regress | ✅ 全通过 |
+| OpenTenBase 5.21.8（1CN + 2DN + GTM） | 同上 + 分布式对照用例 + 节点级对象一致性 + 性能对照 | ✅ 全通过 |
+
+**未验证**：`opentenbase_ora` 兼容模式下的运行语义。
+`CREATE EXTENSION` 在该模式下可建（control 的 `sql_mode = 'all'` 已按内核要求设置），
+但空串等于 NULL、隐式类型转换这类 Oracle 兼容语义对递归查询的影响没有实测过——
+切换该模式需要重新编译内核（`sql_mode` 在本版本是 `PGC_INTERNAL`，不可通过配置或 SQL 修改）。
+如果你在用 ora 模式，请先用小图跑一遍 `test/03_regress.sql` 确认。
+
+另外注意：生成函数在 OpenTenBase 上是 CN 侧 "pull-up" 函数，
+`INSERT ... SELECT f()`、`WHERE EXISTS (SELECT ... f())`、以及与本地临时表做
+`EXCEPT`/`INTERSECT` 这几种写法在该版本上会报错或**静默返回错误结果**。
+受影响的构造与替代写法见 [doc/opentenbase-port.md](doc/opentenbase-port.md) §8.2。
+
+完整的验证矩阵、性能数据与集群搭建坑见
+[doc/opentenbase-port.md](doc/opentenbase-port.md)。
 
 ---
 
@@ -205,15 +287,23 @@ PG 不允许递归 CTE 的 anchor 项直接带 `ORDER BY` / `LIMIT` 后接 `UNIO
     python3 test/lint_sql.py         # SQL 模板静态门禁（4 类高危问题，不需要数据库）
     psql -d <db> -f test/01_setup.sql        # 造小图 + 装实例
     psql -d <db> -f test/02_correctness.sql  # 15 项人工可推演的正确性验证
-    psql -d <db> -f test/03_regress.sql      # 16 项断言式回归
+    psql -d <db> -f test/03_regress.sql      # 18 项断言式回归
 
-`verify_all.sh` 会 `make install` 并在 `postgres` 库上重装扩展；只想验证改动时，
-用 SKILL.md 第 9 节的"独立库验证配方"，不碰已安装的 extension 目录。
+    # 社区标准回归（pg_regress，T1–T15）
+    make installcheck
+
+    # OpenTenBase 专有：分布式对照 + 节点级检查
+    psql -d <db> -f test/opentenbase/01_setup_distributed.sql   # 复制表/哈希表 × 有向/无向
+    psql -d <db> -f test/opentenbase/02_verify_nodes.sql        # EXECUTE DIRECT 查 DN 侧对象
+
+`verify_all.sh` 走环境变量里的连接参数（`PGHOST/PGPORT/PGUSER/PGDATABASE`），
+自动识别“原生单机 / OpenTenBase 集群”并选对应装载方式；它会建一个临时库，
+验证完删掉（`KEEP_DB=1` 可保留，`VERIFY_CREATE_AGE=1` 可规避下文的 AGE 陷阱）。
 
 > 环境提示：若实例的 `shared_preload_libraries` 里预载了 `age`，在"age 已预载、
 > 但当前库未 `CREATE EXTENSION age`"的库里，`03_regress.sql` 的 R10 会在 `TRUNCATE`
 > 临时表时报 `schema "ag_catalog" does not exist`（AGE 的钩子介入，与本扩展无关）。
-> 测试库先 `CREATE EXTENSION age;`，或换一个未预载 age 的实例。
+> 测试库先 `CREATE EXTENSION age;`（或设 `VERIFY_CREATE_AGE=1`），或换一个未预载 age 的实例。
 
 静态门禁抓到过真实 bug（子查询投影缺 `AS` 别名导致运行期报
 `column t.depth does not exist`），值得在改模板后先跑一遍。
@@ -288,20 +378,68 @@ PG 不允许递归 CTE 的 anchor 项直接带 `ORDER BY` / `LIMIT` 后接 `UNIO
 
     pg_graph_search/
     ├── SKILL.md                     # 面向 AI Agent 的操作手册：怎么用、怎么验、哪里会踩坑
-    ├── README.md                    # 本文：设计动机、相对原文的修正、实测数据
-    ├── Makefile                     # 拼接 sql/*.sql → pg_graph_search--1.0.0.sql
-    ├── pg_graph_search--1.0.0.sql  # 交付物，由 make sql 生成，勿手改
-    ├── pg_graph_search.control     # 扩展元信息（schema=graph_search，不可重定位）
+    ├── README.md                    # 本文：设计动机、相对原文的修正、实测数据、OpenTenBase 适配
+    ├── Makefile                     # 拼接 sql/*.sql → pg_graph_search--1.0.0.sql（含双档构建）
+    ├── pg_graph_search--1.0.0.sql  # 交付物，由 make 生成，勿手改
+    ├── pg_graph_search.control     # 扩展元信息（schema=graph_search / sql_mode=all）
     ├── sql/                         # 唯一需要手改的源，6 个片段按文件名顺序拼接
-    │   ├── 00_header.sql            #   文件头注释
+    │   ├── 00_header.sql            #   文件头注释 + OpenTenBase 适配说明
     │   ├── 10_assert.sql            #   列断言 / schema 限定渲染 / 反向索引体检 / 点类型推导
     │   ├── 20_norm.sql              #   _norm：spec 校验与缺省补齐
     │   ├── 30_ddl_basic.sql         #   边视图 + N 度搜索 + 游标 DDL 构造器
     │   ├── 31_ddl_shortest.sql      #   最短路径（BFS）+ 子图 JSON + 分层统计 DDL 构造器
     │   └── 40_meta.sql              #   registry / plan / advise / install / uninstall / list
-    ├── test/                        # 静态门禁 + 正确性 + 断言式回归 + 一键全链路
-    ├── bench/                       # 95 万边规模压测与数据生成脚本
-    └── doc/                         # 预留
+    │                                #   + registry_distribution / set_registry_replication
+    ├── test/
+    │   ├── lint_sql.py              #   SQL 模板静态门禁（4 类高危模式）
+    │   ├── 01_setup.sql             #   造小图 + 装有向/无向实例
+    │   ├── 02_correctness.sql       #   15 项人工可推演正确性
+    │   ├── 03_regress.sql           #   18 项断言式回归
+    │   ├── verify_all.sh            #   一键全链路（自动识别单机/集群）
+    │   ├── sql/ + expected/         #   pg_regress 用例与期望输出
+    │   └── opentenbase/             #   分布式对照 + 节点级检查（EXECUTE DIRECT）
+    ├── bench/                       # 95 万边规模压测与数据生成（支持 DIST=replication|hash）
+    └── doc/
+        └── opentenbase-port.md      # 移植说明、依据、Runbook、验证矩阵、待实测清单
 
 使用顺序：人读 `README.md` 了解设计；Agent 读 `SKILL.md` 执行操作；
-改实现只改 `sql/`，然后 `make sql` + 跑 `test/`。
+改实现只改 `sql/`，然后 `make` + 跑 `test/`。
+
+---
+
+## 十、OpenTenBase 适配
+
+本目录即 OpenTenBase 的 `contrib/pg_graph_search`。适配点少但关键：
+
+| 问题 | 处理 |
+|---|---|
+| 注册表默认会被 **HASH(target_schema)** 分布，每个 DN 只看到一部分实例清单 | 注册表 DDL 末尾注入 `DISTRIBUTE BY REPLICATION`（构建期占位符，见 `Makefile`） |
+| OpenTenBase 的 `check_extension_in_right_mode()` 默认只接受 `postgresql` 模式 | `control` 增加 `sql_mode = 'all'`，`opentenbase_ora` 模式下也能建扩展 |
+| `CREATE EXTENSION` 是两阶段（PREPARE/EXECUTE）+ 全节点广播，脚本会在每个节点执行 | 本扩展纯 SQL、无 `.so`、无本地文件依赖，天然符合该协议；官方 `contrib/opentenbase_ai` 已用同样方式在扩展脚本里建复制表 |
+| 生成物若依赖 `search_path` 会在 CN/DN 不一致 | 生成物一律 schema 限定（`_qualified()`），不依赖 `search_path` |
+
+新增两个元函数（原生 PostgreSQL 上也能创建，只是没有分布概念）：
+
+    SELECT graph_search.registry_distribution();
+    --  OpenTenBase: REPLICATION / HASH / MODULO / DISTRIBUTED / NONE
+    --  原生 PostgreSQL: single-node
+
+    SELECT graph_search.set_registry_replication();
+    --  把已有注册表改成 REPLICATION（幂等）；单机上明确报错
+
+`install()` 在写入实例前会静默体检：注册表若不是 `REPLICATION`，发一条 WARNING 并给出修复命令。
+
+**边表怎么分布**（使用者决定，直接决定性能）：
+
+    -- 中小图（单机实测 95 万边 / 88 MB 量级完全可行）：复制表，每 DN 全量图
+    CREATE TABLE public.t_edge (...) DISTRIBUTE BY REPLICATION;
+    CREATE INDEX ON public.t_edge (c2, c1);      -- 无向图必须建反向索引
+
+    -- 大图：哈希分布存储友好，但 CN 侧递归要按 frontier 反复跨节点取数，必须压测
+    CREATE TABLE public.t_edge (...) DISTRIBUTE BY shard (c1);
+
+分布函数仍是 `graph_search.<实例名>_n_degree()` 等，返回的是 CN 侧聚合结果；
+`EXECUTE DIRECT` 下看不到这些由 `CREATE EXTENSION` 广播出去的 schema 内对象之外的东西。
+
+分布式完整 Runbook（建集群、建扩展、验证 DN 侧对象、故障注入、性能清单）
+见 [doc/opentenbase-port.md](doc/opentenbase-port.md)。

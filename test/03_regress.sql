@@ -131,36 +131,51 @@ END $$;
 \echo 'R9 OK'
 
 \echo '--- R10: 游标分页结果与 search 逐行一致 ---'
+-- 注意（OpenTenBase）：gtest.t_search() 是 CN 侧 "pull-up" 函数，
+--   * 不能出现在 DML 里：INSERT INTO ... SELECT f() → "Using pull-up functions
+--     in DML statements is not supported"
+--   * 不能出现在子计划里：... WHERE EXISTS (SELECT ... f()) → "Subplan contains a
+--     function runs on CN which is not supported"
+--   * 与本地临时表做 EXCEPT/INTERSECT 不报错但结果错（实测 9 行会变成 3 行）
+--   * array_agg() 聚合 int[] 列会报 "cannot accumulate arrays of different
+--     dimensionality"（array_agg 一律按 int[] 的数组处理，维度判断失真）
+-- 所以这里不做集合运算、也不聚合数组，改为把每条路径转成文本、两侧各自排序成
+-- text[] 之后直接比较数组。
 DO $$
 DECLARE
   c  refcursor;
   r  record;
   n1 int; n2 int;
+  v_search  text[];
+  v_cursor  text[] := '{}';
+  v_cursor_sorted text[];
 BEGIN
   SELECT count(*) INTO n1 FROM gtest.t_search(1,3,1000,0);
 
   SELECT gtest.t_cursor(1,'c_r10',3,1000,0) INTO c;
-  CREATE TEMP TABLE IF NOT EXISTS _r10(o_path int[]);
-  TRUNCATE _r10;
   LOOP
     FETCH c INTO r;
     EXIT WHEN NOT FOUND;
-    INSERT INTO _r10 VALUES (r.o_path);
+    n2 := n2 + 1;
+    v_cursor := v_cursor || r.o_path::text;
   END LOOP;
   CLOSE c;
 
-  SELECT count(*) INTO n2 FROM _r10;
   IF n1 <> n2 THEN
     RAISE EXCEPTION '游标 % 行 vs search % 行', n2, n1;
   END IF;
   IF n1 <> 9 THEN
     RAISE EXCEPTION '期望 9 条路径，实际 %', n1;
   END IF;
-  IF EXISTS (SELECT o_path FROM gtest.t_search(1,3,1000,0) EXCEPT SELECT o_path FROM _r10)
-     OR EXISTS (SELECT o_path FROM _r10 EXCEPT SELECT o_path FROM gtest.t_search(1,3,1000,0)) THEN
-    RAISE EXCEPTION '游标与 search 的路径集合不一致';
+
+  SELECT array_agg(o_path::text ORDER BY o_path::text)
+    INTO v_search FROM gtest.t_search(1,3,1000,0);
+  SELECT array_agg(p ORDER BY p)
+    INTO v_cursor_sorted FROM unnest(v_cursor) AS p;
+  IF v_cursor_sorted IS DISTINCT FROM v_search THEN
+    RAISE EXCEPTION '游标与 search 的路径集合不一致: % vs %',
+      v_cursor_sorted, v_search;
   END IF;
-  DROP TABLE _r10;
 END $$;
 \echo 'R10 OK'
 
@@ -262,5 +277,43 @@ BEGIN
 END $$;
 \echo 'R16 OK'
 
+\echo '--- R17: 注册表分布策略可观测（OpenTenBase 期望 REPLICATION，单机 single-node） ---'
+DO $$
+DECLARE v text := graph_search.registry_distribution();
+BEGIN
+  IF v NOT IN ('single-node', 'REPLICATION') THEN
+    RAISE EXCEPTION '注册表分布策略应为 single-node 或 REPLICATION，实际 %；'
+                      '在 OpenTenBase 上请执行 SELECT graph_search.set_registry_replication();', v;
+  END IF;
+END $$;
+\echo 'R17 OK'
+
+\echo '--- R18: set_registry_replication() 在单机上明确报错，在集群上幂等 ---'
+DO $$
+DECLARE v_cur text := graph_search.registry_distribution();
+        v_out text;
+        v_ok  boolean := false;
+BEGIN
+  IF v_cur = 'single-node' THEN
+    BEGIN
+      PERFORM graph_search.set_registry_replication();
+    EXCEPTION WHEN OTHERS THEN
+      v_ok := true;
+    END;
+    IF NOT v_ok THEN
+      RAISE EXCEPTION '单机实例上 set_registry_replication() 应报错';
+    END IF;
+  ELSE
+    v_out := graph_search.set_registry_replication();
+    IF v_out IS NULL OR v_out = '' THEN
+      RAISE EXCEPTION '集群上 set_registry_replication() 应返回说明文本';
+    END IF;
+    IF graph_search.registry_distribution() <> 'REPLICATION' THEN
+      RAISE EXCEPTION 'set_registry_replication() 执行后仍不是 REPLICATION';
+    END IF;
+  END IF;
+END $$;
+\echo 'R18 OK'
+
 \echo ''
-\echo '==== 全部 16 项回归通过 ===='
+\echo '==== 全部 18 项回归通过 ===='

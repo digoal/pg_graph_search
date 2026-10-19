@@ -13,10 +13,112 @@ CREATE TABLE IF NOT EXISTS graph_search.registry (
     installed_by    name        NOT NULL DEFAULT current_user,
     objects         text[]      NOT NULL DEFAULT '{}',
     PRIMARY KEY (target_schema, prefix)
-);
+) @DISTRIBUTE_CLAUSE@;
 
 COMMENT ON TABLE graph_search.registry IS
   '已安装的图搜索实例；uninstall() 依据此表精确清理生成对象';
+
+
+/*
+ * 6b. OpenTenBase / Postgres-XL 适配：注册表的分布策略。
+ *
+ *     注册表是「集群级元数据」：CN 上的 install() / uninstall() / list_installed()
+ *     都要读它。OpenTenBase 的默认分布规则是「取主键或唯一约束的第一列」
+ *     （见 doc/src/sgml/ddl.sgml），本表主键是 (target_schema, prefix)，
+ *     默认会变成 HASH(target_schema)：每个 DN 只持有一部分实例清单，
+ *     节点之间看到的 registry 不一致，排查时容易误判「实例没装上」。
+ *
+ *     所以构建时把上面 DDL 里的分布子句占位符替换为 DISTRIBUTE BY REPLICATION
+ *     （OpenTenBase 默认，见 Makefile）；在原生 PostgreSQL 上做可移植验证时
+ *     传 OPENTENBASE=0 生成空子句（make portable）。
+ *
+ *     下面两个函数让这件事「可观测、可修复」：
+ *       registry_distribution()    —— 当前分布策略（原生 PG 返回 single-node）
+ *       set_registry_replication() —— 把已有注册表改成 REPLICATION（幂等）
+ */
+CREATE OR REPLACE FUNCTION graph_search.registry_distribution()
+RETURNS text
+LANGUAGE plpgsql STABLE
+AS $pga$
+DECLARE
+  v_type char;
+BEGIN
+  -- 有没有 pgxc_class 目录（只有 OpenTenBase/Postgres-XL 才有）；
+  -- 用动态 SQL 是为了让同一份源码在原生 PostgreSQL 上也能创建/执行
+  IF to_regclass('pg_catalog.pgxc_class') IS NULL THEN
+    RETURN 'single-node';
+  END IF;
+
+  EXECUTE 'SELECT p.pclocatortype FROM pg_catalog.pgxc_class p
+            WHERE p.pcrelid = $1'
+     INTO v_type
+    USING 'graph_search.registry'::regclass;
+
+  IF v_type IS NULL THEN
+    RETURN 'unknown';
+  END IF;
+
+  -- 取值见 src/include/pgxc/locator.h
+  RETURN CASE v_type
+           WHEN 'R' THEN 'REPLICATION'
+           WHEN 'S' THEN 'SHARD'
+           WHEN 'H' THEN 'HASH'
+           WHEN 'M' THEN 'MODULO'
+           WHEN 'D' THEN 'DISTRIBUTED'
+           WHEN 'O' THEN 'NONE'
+           ELSE 'OTHER:' || v_type
+         END;
+END
+$pga$;
+
+COMMENT ON FUNCTION graph_search.registry_distribution() IS
+  '注册表当前的分布策略：REPLICATION/SHARD/HASH/MODULO/DISTRIBUTED/NONE；原生 PostgreSQL 返回 single-node';
+
+
+CREATE OR REPLACE FUNCTION graph_search.set_registry_replication()
+RETURNS text
+LANGUAGE plpgsql VOLATILE
+AS $pga$
+DECLARE
+  v_cur text := graph_search.registry_distribution();
+  v_ddl text := 'ALTER TABLE graph_search.registry DISTRIBUTE BY REPLICATION';
+BEGIN
+  IF v_cur = 'single-node' THEN
+    RAISE EXCEPTION '当前实例不是 OpenTenBase 集群，单机不需要分布策略'
+      USING HINT = '本函数只在分布式集群上有意义';
+  END IF;
+
+  IF v_cur = 'REPLICATION' THEN
+    RETURN 'already REPLICATION';
+  END IF;
+
+  EXECUTE v_ddl;
+  RETURN v_ddl;
+END
+$pga$;
+
+COMMENT ON FUNCTION graph_search.set_registry_replication() IS
+  '把注册表改成 DISTRIBUTE BY REPLICATION（仅在 OpenTenBase 集群上有效，幂等）';
+
+
+CREATE OR REPLACE FUNCTION graph_search._check_registry_distribution()
+RETURNS void
+LANGUAGE plpgsql STABLE
+AS $pga$
+DECLARE
+  v_cur text := graph_search.registry_distribution();
+BEGIN
+  IF v_cur IN ('single-node', 'REPLICATION') THEN
+    RETURN;
+  END IF;
+
+  RAISE WARNING 'graph_search.registry 的分布策略是 %，各节点看到的实例清单可能不一致；'
+                '建议执行：SELECT graph_search.set_registry_replication();', v_cur;
+END
+$pga$;
+
+COMMENT ON FUNCTION graph_search._check_registry_distribution() IS
+  '安装前的静默体检：注册表不是 REPLICATION 时给出 WARNING（不改数据）';
 
 
 /*
@@ -131,6 +233,10 @@ BEGIN
   IF EXISTS (SELECT 1 FROM graph_search.registry WHERE target_schema = v_schema AND prefix = v_prefix) THEN
     PERFORM graph_search.uninstall(v_schema, v_prefix, false);
   END IF;
+
+  -- OpenTenBase 适配：注册表必须是 REPLICATION 分布，否则 CN/DN 看到的
+  -- 实例清单不一致（只 WARNING，不阻断安装）
+  PERFORM graph_search._check_registry_distribution();
 
   v_ddl := graph_search.plan(p_spec);
   FOREACH v_stmt IN ARRAY v_ddl LOOP
